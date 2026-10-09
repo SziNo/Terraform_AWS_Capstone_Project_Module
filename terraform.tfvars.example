@@ -1,0 +1,8 @@
+subnets = [
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "public" },
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "public" },
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "private" },
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "private" },
+]
+
+region = "<aws-region>"
