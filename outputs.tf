@@ -49,3 +49,8 @@ output "ssh_ec2_instances" {
     name => "ssh -J ec2-user@${local.jump_bastion_ip} ec2-user@${ip}"
   }
 }
+
+output "alb_url" {
+  description = "URL of the Application Load Balancer"
+  value       = "http://${module.alb.dns_name}"
+}

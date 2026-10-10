@@ -38,3 +38,24 @@ module "ec2" {
 
   bastion_security_group_id = module.bastion.security_group_id
 }
+
+module "alb" {
+  source = "./modules/alb"
+
+  vpc_id              = module.vpc.vpc_id
+  vpc_cidr            = module.vpc.vpc_cidr
+  subnet_ids          = module.vpc.public_subnet_ids
+  target_instance_ids = module.ec2.instance_ids
+  name_prefix         = var.project
+}
+
+# Connects two modules: lets the ALB (source) reach the EC2 instances (destination) on port 80.
+# Lives in the root so neither module has to know about the other.
+resource "aws_vpc_security_group_ingress_rule" "http_from_alb_to_ec2" {
+  security_group_id            = module.ec2.security_group_id
+  referenced_security_group_id = module.alb.security_group_id
+  description                  = "HTTP from the ALB to the EC2 instances"
+  ip_protocol                  = "tcp"
+  from_port                    = 80
+  to_port                      = 80
+}
