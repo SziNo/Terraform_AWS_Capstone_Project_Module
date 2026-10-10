@@ -1,5 +1,3 @@
-# variables.tf (root)
-
 variable "region" {
   description = "AWS region"
   type        = string
@@ -68,4 +66,12 @@ variable "ec2_config" {
     condition     = alltrue([for n in values(var.ec2_config) : n >= 0 && floor(n) == n])
     error_message = "Instance counts must be non-negative whole numbers."
   }
+}
+
+variable "bastion_config" {
+  description = "Bastion hosts to create (unique name + public subnet name)"
+  type = list(object({
+    name   = string
+    subnet = string
+  }))
 }

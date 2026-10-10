@@ -1,5 +1,3 @@
-# modules/vpc/main.tf
-
 locals {
   public_subnets  = { for s in var.subnets : s.name => s if s.type == "public" }
   private_subnets = { for s in var.subnets : s.name => s if s.type == "private" }
