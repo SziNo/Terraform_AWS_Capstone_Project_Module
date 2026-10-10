@@ -1,8 +1,45 @@
+region           = "<aws-region>"
+allowed_ssh_cidr = "<your-public-ip>/32"
+
 subnets = [
   { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "public" },
   { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "public" },
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "public" },
+  { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "private" },
   { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "private" },
   { name = "<subnet-name>", cidr = "<x.x.x.x/24>", az = "<region><az-letter>", type = "private" },
 ]
 
-region = "<aws-region>"
+# subnets = [{ name = "public-a", cidr = "10.0.1.0/24", az = "eu-west-1a", type = "public" }, ...]
+
+key_pair = {
+  name       = "<key-pair-name>"
+  public_key = "<contents of ~/.ssh/<key-pair-name>.pub>"
+}
+
+vpc_config = {
+  cidr       = "<x.x.x.x/16>"
+  name       = "<project-name>"
+  nat_subnet = "<public-subnet-name>"
+}
+
+ec2_config = {
+  "<private-subnet-name>" = 2
+  "<private-subnet-name>" = 1
+  "<private-subnet-name>" = 1
+}
+
+# ec2_config = { "private-a" = 2, "private-b" = 1 }   # keys must match private subnet names
+
+bastion_config = [
+  { name = "<bastion-name>", subnet = "<public-subnet-name>" },
+  { name = "<bastion-name>", subnet = "<public-subnet-name>" },
+  { name = "<bastion-name>", subnet = "<public-subnet-name>" },
+]
+
+# bastion_config = [{ name = "bastion-1", subnet = "public-a" }, ...]   # subnet must be a public subnet name
+
+# Optional, these have defaults:
+# instance_type = "t2.micro"   # only t2.micro is allowed (validated)
+# project       = "capstone"
+# environment   = "dev"
