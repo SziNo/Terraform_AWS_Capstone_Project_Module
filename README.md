@@ -28,6 +28,8 @@ Forgalmi utak:
 - **HTTP:** internet → ALB (80) → privát EC2 (80, csak az ALB SG-ből)
 - **Kimenő forgalom:** privát EC2 → NAT Gateway → internet (pl. `dnf install`)
 
+Egy VPC-n belül minden subnet eléri a többit: minden route táblában van egy automatikus `local` route a VPC teljes CIDR-jére. Ezért az ALB és a gépek között nem kell route-ot írni; hogy ki kihez beszélhet, azt a security groupok döntik el.
+
 ## Projektstruktúra
 
 ```
@@ -49,6 +51,8 @@ Forgalmi utak:
     ├── bastion/                # bastion hostok és a security groupjuk
     └── alb/                    # Application Load Balancer, target group, listener
 ```
+
+A root modul a közös dolgokat birtokolja (provider, backend, key pair, AMI data source), és a modulok közötti kapcsolatokat (modulhívások, összekötő SG szabály, outputok). A modulok csak azt látják, amit bemenetként kapnak, és csak azt adják ki, amit outputként exportálnak.
 
 ## Modulok
 
@@ -118,11 +122,42 @@ Application Load Balancer a public subnetekben, target group health checkkel, a 
 
 Az ALB-t a kész projekthez adtuk hozzá úgy, hogy a `vpc`, `ec2-instance` és `bastion` modul egyetlen fájljához sem kellett nyúlni: csak egy új modul, egy új modulhívás, egy összekötő SG szabály és egy új output került a rootba.
 
+## Security groupok
+
+Minden szerepnek (bastion, EC2, ALB) saját SG-je van a saját moduljában. Egy SG azt írja le, mi juthat be az adott szerepű gépekre. Az SG valójában a gépek hálózati interfészéhez (ENI) tartozik: az EC2 és a bastion instance-ok primary ENI-jén, illetve az ALB node-jainak ENI-jein.
+
+Egy szabálynak két fontos mezője van:
+
+- `security_group_id` = **hova**: melyik SG szabálylistájába kerül a szabály, vagyis kiknek a gépeit védi
+- `referenced_security_group_id` = **honnan**: azok a gépek jöhetnek, amelyek ezt az SG-t viselik (mint egy belépőkártya). A forrás lehet IP-tartomány is (`cidr_ipv4`), pl. a saját IP-d vagy `0.0.0.0/0`.
+
+Apply után a három SG szabályai:
+
+| SG             | Irány | Szabály                      | Ki hozta létre                |
+| -------------- | ----- | ---------------------------- | ----------------------------- |
+| **ALB SG**     | be    | 80 bárhonnan                 | ALB modul                     |
+|                | ki    | 80 a VPC-be                  | ALB modul                     |
+| **EC2 SG**     | be    | 22 a bastion SG-ből          | EC2 modul                     |
+|                | be    | 80 az ALB SG-ből             | root (`http_from_alb_to_ec2`) |
+|                | ki    | minden                       | EC2 modul                     |
+| **bastion SG** | be    | 22 az `allowed_ssh_cidr`-ről | bastion modul                 |
+|                | ki    | 22 a VPC-be                  | bastion modul                 |
+
+A `from_port` és `to_port` egy porttartományt jelöl (egyetlen porthoz mindkettő ugyanaz), az irányt a resource típusa adja (`ingress_rule` / `egress_rule`). A security groupok állapottartók (stateful): egy beengedett kapcsolat válaszforgalma szabály nélkül is visszajut.
+
 ## Skálázhatóság
 
 A bemenetek listák vagy mapek, amiket a modulok név szerint kulcsolt mapekké alakítanak (list-to-map minta), és ezeken megy a `for_each`. A resource címek így nevet viselnek index helyett, pl. `module.vpc.aws_subnet.private["private-a"]`, `module.ec2.aws_instance.this["private-a-2"]`.
 
-Az EC2 modul a subnetenkénti darabszámból gépenkénti mapet készít (`merge` + beágyazott `for`):
+Az EC2 modul a `main.tf` elején, a `locals` blokkban a subnetenkénti darabszámból gépenkénti mapet készít. A belső `for` subnetenként egy kis mapet csinál, a külső listába gyűjti ezeket, a `merge(...)` pedig egy mappé fésüli őket (a `...` a lista elemeit külön argumentumként adja át, mint a JavaScript spread operátora):
+
+```hcl
+instances = merge([
+  for subnet, n in var.ec2_config : {
+    for i in range(1, n + 1) : "${subnet}-${i}" => subnet
+  }
+]...)
+```
 
 ```
 { "private-a" = 2, "private-b" = 1 }
@@ -132,21 +167,21 @@ Az EC2 modul a subnetenkénti darabszámból gépenkénti mapet készít (`merge
 Példák, amikhez csak a `terraform.tfvars`-t kell módosítani:
 
 - **Új subnet:** egy új sor a `subnets` listában → a plan csak a subnetet és az associationjét hozza létre.
-- **Több gép egy subnetben:** `"private-a" = 3` → egy új gép jön létre (`private-a-3`), és automatikusan bekerül az ALB target groupjába.
-- **Gép elvétele:** a darabszám csökkentésekor mindig az utolsó sorszámú gép törlődik, a többi érintetlen.
+- **Több gép egy subnetben:** `"private-a" = 3` → létrejön a `private-a-3` gép, és automatikusan bekerül az ALB target groupjába. A lánc: az EC2 modul `instance_ids` outputjában megjelenik az új kulcs → a root ezt adja át az ALB modulnak (`target_instance_ids`) → az attachment `for_each`-e ugyanezen a mapen megy, így új kulcs = új attachment.
+- **Gép elvétele:** a kulcsokat a `range(1, n + 1)` generálja, így a darabszám csökkentésekor mindig a legnagyobb sorszámú kulcs tűnik el, és csak az a gép törlődik. Egy középső gépet így nem lehet célzottan kivenni.
 - **Új bastion:** egy új elem a `bastion_config` listában.
 
 Hibás bemenetet a változók validációi már a plan elején jeleznek: ismeretlen subnet típus, nem létező vagy nem public NAT subnet, ismeretlen subnet az `ec2_config`-ban vagy a `bastion_config`-ban, duplikált bastion név, negatív vagy tört gépszám, egynél kevesebb ALB subnet, nem engedélyezett instance típus.
 
 ## Tervezési döntések
 
-- **A key pair a rootban van**, a feladat leírásával ellentétben (az EC2 modul helyett). Az EC2 gépek és a bastionok is használják, ezért a legközelebbi közös szülőbe került. Így mindkét modul egyenrangúan kapja a kulcs nevét, és nem kell az egyik modulnak a másiknak továbbadnia. A root ugyanígy birtokolja a közös AMI data source-t is.
-- **A security group szabályok külön resource-ok** (`aws_vpc_security_group_ingress_rule` / `egress_rule`), nem inline blokkok. Így más modulok vagy a root ütközés nélkül adhatnak szabályt egy SG-hez, ahogy az ALB → EC2 szabálynál történik.
-- **Az ALB → EC2 összekötő szabály a rootban van**, mert két modul SG-jét köti össze. Így egyik modulnak sem kell tudnia a másikról.
-- **Legkisebb jogosultság (least privilege):** a bastion kifelé csak SSH-t indíthat a VPC-n belülre, internet-hozzáférése nincs. Az ALB kifelé csak HTTP-t a VPC-be. A bastiont nem frissítjük helyben; ha új csomag vagy javítás kell, friss AMI-ból újraépül (immutable infrastructure).
-- **A NAT Gateway helye explicit** (`nat_subnet`), validációval. Pozíció alapú választásnál (pl. az első public subnet) egy új subnet felvétele a NAT cseréjét okozhatná.
+- **A key pair a rootban van**, a feladat leírásával ellentétben (az EC2 modul helyett). Az EC2 gépek és a bastionok is használják, ezért a legközelebbi közös szülőbe került. Így mindkét modul egyenrangúan kapja a kulcs nevét, és a két modul nem függ kölcsönösen egymástól. A root ugyanígy birtokolja a közös AMI data source-t is.
+- **A security group szabályok külön resource-ok** (`aws_vpc_security_group_ingress_rule` / `egress_rule`), nem inline `ingress {}` / `egress {}` blokkok. Egy inline szabálylista azt jelenti, hogy „ennek az SG-nek pontosan ezek a szabályai”, és a Terraform minden futásnál törölné, amit valaki más (pl. a root) adott hozzá, majd az visszarakná, oda-vissza. Külön resource-oknál mindenki csak a saját szabályát kezeli, így több helyről is lehet szabályt adni ugyanahhoz az SG-hez.
+- **Az ALB → EC2 összekötő szabály a rootban van** (`http_from_alb_to_ec2`, a `main.tf` végén). Egyetlen szabályt ír az EC2 SG-be: a 80-as porton jöhet forgalom az ALB SG-t viselő gépekről. Azért a rootban, mert két modul SG-jét köti össze, így egyik modulnak sem kell tudnia a másikról. SG-hivatkozás (és nem IP) azért, mert az ALB node-jainak IP-címei változhatnak.
+- **Legkisebb jogosultság (least privilege):** a bastion kifelé csak SSH-t indíthat a VPC-n belülre, internet-hozzáférése nincs (routing szempontból lenne, az IGW-n át, a security group tiltja). Az ALB kifelé csak HTTP-t a VPC-be. A bastiont nem frissítjük helyben; ha új csomag vagy javítás kell, friss AMI-ból újraépül (immutable infrastructure).
+- **A NAT Gateway helye explicit** (`nat_subnet = "public-a"`), validációval. Pozíció alapú választásnál (pl. „az ábécérendben első public subnet”) egy új, előrébb soroló subnet (pl. `public-0`) felvétele megváltoztatná a NAT subnetjét, ami a NAT cseréjével (és kiesésével) járna.
 - **A `private_subnet_ids` output a route table associationöktől függ** (`depends_on`), így a privát gépek csak akkor indulnak, amikor a NAT route már él, és a user data `dnf install` parancsa nem hasal el boot közben.
-- **IMDSv2 kötelező** minden gépen (`http_tokens = "required"`).
+- **IMDSv2 kötelező** minden gépen (`metadata_options { http_tokens = "required" }`). Minden EC2-n fut egy metadata szolgáltatás (`169.254.169.254`), amiből a gép lekérdezheti a saját adatait, és ha van IAM role-ja, annak ideiglenes kulcsait is. Az IMDSv1 sima GET kéréssel működik, amit egy SSRF-típusú támadás kihasználhat; az IMDSv2 előbb tokent kér. A beállítás a gép tulajdonsága, ezért minden gépen ott van; a user data script emiatt kér tokent az instance ID lekérdezéséhez.
 - **`default_tags` a providerben:** az `Environment`, `Project` és `ManagedBy` tag minden erőforrásra automatikusan rákerül, a modulokban csak a `Name` tag szerepel.
 - **Csak `t2.micro`** engedélyezett (root szintű validáció), a free tier miatt. A validáció a rootban van, nem a modulban, mert ez a fiók korlátja, nem a modulé.
 - **Remote state S3-ban, `use_lockfile`-lal.** A feladat S3 + DynamoDB-t említ; a `use_lockfile` az újabb, S3-natív locking, ami a DynamoDB-s megoldást váltja. A bucket tudatosan **verziózás nélküli**: egyszerűbb a takarítás, cserébe egy véletlenül törölt vagy felülírt state nem állítható vissza.
@@ -160,26 +195,32 @@ Hibás bemenetet a változók validációi már a plan elején jeleznek: ismeret
 
 ## Telepítés lépésről lépésre
 
-1. **SSH kulcspár generálása** (a privát kulcs a gépeden marad, csak a publikus kerül az AWS-be):
+1. **SSH kulcspár generálása** (egyszer; a privát kulcs a gépeden marad, csak a publikus kerül az AWS-be):
 
    ```bash
    ssh-keygen -t ed25519 -f ~/.ssh/capstone-module-key -C "capstone-module"
    cat ~/.ssh/capstone-module-key.pub
    ```
 
-2. **A `terraform.tfvars` elkészítése** a minta alapján. A saját publikus IP-d: `curl -s https://checkip.amazonaws.com`, a `allowed_ssh_cidr` ennek `/32`-es változata. A `key_pair.public_key` a `.pub` fájl tartalma.
+2. **A `terraform.tfvars` elkészítése** a minta alapján. A `key_pair.public_key` a `.pub` fájl tartalma.
 
    ```bash
    cp terraform.tfvars.example terraform.tfvars
    ```
 
-3. **A state bucket létrehozása** (egyszer, verziózás nélkül):
+3. **A saját publikus IP ellenőrzése** minden apply előtt (otthoni internetnél változhat). Ha eltér, írd át az `allowed_ssh_cidr`-t (`<ip>/32`), különben nem tudsz SSH-zni a bastionokra.
+
+   ```bash
+   curl -s https://checkip.amazonaws.com
+   ```
+
+4. **A state bucket létrehozása** (egyszer, verziózás nélkül):
 
    ```bash
    aws s3 mb s3://szino-terraform-state --region eu-west-1
    ```
 
-4. **A backend bekapcsolása:** a `versions.tf`-ben vedd le a kommentet a `backend "s3"` blokkról, majd:
+5. **A backend bekapcsolása:** a `versions.tf`-ben vedd le a kommentet a `backend "s3"` blokkról, majd:
 
    ```bash
    terraform init
@@ -187,7 +228,7 @@ Hibás bemenetet a változók validációi már a plan elején jeleznek: ismeret
 
    Mivel még nincs lokális state, nincs mit migrálni, a sima `init` elég.
 
-5. **Ellenőrzés:**
+6. **Ellenőrzés:**
 
    ```bash
    terraform fmt -recursive
@@ -195,13 +236,13 @@ Hibás bemenetet a változók validációi már a plan elején jeleznek: ismeret
    terraform plan
    ```
 
-   A plan az alapértékekkel: `Plan: 43 to add, 0 to change, 0 to destroy.` Modulonkénti bontás:
+   A plan az alapértékekkel: `Plan: 43 to add, 0 to change, 0 to destroy.` Ha a szám nem egyezik, modulonkénti bontás:
 
    ```bash
    terraform plan -no-color | grep "will be created" | grep -oE "module\.[a-z0-9_-]+" | sort | uniq -c
    ```
 
-6. **Apply:**
+7. **Apply** (kb. 5 perc; a NAT Gateway és az ALB a leglassabb):
 
    ```bash
    terraform apply
@@ -209,62 +250,91 @@ Hibás bemenetet a változók validációi már a plan elején jeleznek: ismeret
 
 ## Tesztelés
 
+### 0. Előkészítés (a saját gépeden, a projekt gyökeréből)
+
+```bash
+terraform output                          # címek, ID-k, kész SSH parancsok – innen másolsz
+eval "$(ssh-agent -s)"                    # elindítja az agentet ebben a terminálban
+ssh-add ~/.ssh/capstone-module-key        # betölti a kulcsot
+ssh-add -l                                # ellenőrzés: kiírja a betöltött kulcsot
+```
+
+Az outputok kényelmi célt szolgálnak: a Terraform nem futtat semmit, csak összerakja a kész parancsokat, így semmit nem kell kikeresni a konzolban. Az agent a `ssh -J` ugráshoz kell, mert a `-i` kapcsoló csak az utolsó kapcsolatra vonatkozik, a jump hostra (bastion) nem. Az agent terminálonként él, új terminálban újra kell futtatni.
+
 ### 1. Outputok
 
 ```bash
 terraform output
-terraform output -json ssh_bastions | jq -r '."bastion-1"'
 ```
 
-### 2. SSH a bastionra
+**Várt eredmény:** a `bastions` és `ec2_instances` táblázatosan igazítva, minden gép a saját subnetjének tartományában (`10.0.1–3.x` public, `10.0.4–6.x` private), kész SSH parancsok a `ssh_bastions` és `ssh_ec2_instances` alatt.
+
+### 2. SSH a privát gépre a bastionon keresztül
 
 ```bash
-ssh -i ~/.ssh/capstone-module-key ec2-user@<bastion-public-ip>
+ssh -J ec2-user@<bastion-1 IP> ec2-user@<private-a-1 IP>    # a ssh_ec2_instances outputból
 ```
 
-A kész parancsok a `ssh_bastions` outputban vannak.
+**Várt eredmény:** az első alkalommal két host kulcs kérdés jön (a bastioné és a privát gépé, két külön kapcsolat), mindkettőre `yes`, utána bejutás a privát gépre.
 
-### 3. SSH a privát gépekre a bastionon keresztül
+A `-J` (ProxyJump) két kapcsolatot épít: a gépedről a bastionra, és azon alagútként át a privát gépre. A hitelesítés mindkét kapcsolatnál a te gépedről történik, a privát kulcs nem kerül a bastionra. Ezért biztonságosabb, mint a kulcs átmásolása vagy az agent forwarding (`ssh -A`).
 
-A `ssh -J` (ProxyJump) egy lépésben ugrik át a bastionon. A privát kulcs végig a saját gépeden marad, a bastionra nem kerül semmi, ezért ez biztonságosabb, mint a kulcs átmásolása vagy az agent forwarding. A `-J` a jump hostnál nem használja a `-i` kapcsolót, ezért a kulcsot előbb be kell tölteni az agentbe:
+### 3. A privát gépen: user data, IMDSv2, NAT
 
 ```bash
-eval "$(ssh-agent -s)"
-ssh-add ~/.ssh/capstone-module-key
-ssh -J ec2-user@<bastion-public-ip> ec2-user@<private-ip>
+systemctl status nginx                    # active (running), enabled  (kilépés: q)
+curl -s localhost                         # Hello from i-...  (a gép saját instance ID-ja)
+curl -s https://checkip.amazonaws.com     # meg kell egyeznie a nat_public_ip outputtal
 ```
 
-A kész parancsok a `ssh_ec2_instances` outputban vannak.
+**Mit bizonyít:**
 
-### 4. NAT és user data (a privát gépen)
+- az nginx fut, tehát a `dnf install` boot közben sikeres volt, vagyis a NAT route már élt (a `depends_on` működik)
+- az instance ID megegyezik az outputtal, tehát a script az IMDSv2 tokennel működik
+- a kimenő IP megegyezik a `nat_public_ip`-vel, tehát a privát gép a NAT-on megy ki
+
+### 4. A bastionon: negatív teszt (új terminálban is lehet)
 
 ```bash
-systemctl status nginx                   # fut-e a user data által telepített nginx
-curl -s localhost                        # "Hello from i-..."
-curl -s https://checkip.amazonaws.com    # egyeznie kell a nat_public_ip outputtal
+ssh -i ~/.ssh/capstone-module-key ec2-user@<bastion-1 IP>   # itt nem kell az agent
+curl -m 5 https://checkip.amazonaws.com                     # Connection timed out
 ```
 
-Ha az nginx fut, a `dnf install` sikeres volt, vagyis a NAT, a private route tábla és az output `depends_on`-ja is jól működik.
+**Várt eredmény:** időtúllépés. A bastion egyetlen egress szabálya SSH a VPC-n belülre, a `curl` viszont a bastion által kifelé indított új kapcsolat lenne. Az SSH befelé mégis működik, mert azt az ingress szabály engedi, és a válaszforgalom stateful módon kimehet. A `timed out` (és nem `refused`) azért jön, mert az SG csendben eldobja a nem engedélyezett csomagokat.
 
-### 5. ALB
+### 5. ALB (a saját gépeden, a projekt gyökeréből)
 
-A target group health checkje kb. egy perc után jelöli healthy-nek a gépeket.
+A target group health checkje kb. egy perc után jelöli healthy-nek a gépeket. Az URL böngészőben is megnyitható.
 
 ```bash
 ALB_URL=$(terraform output -raw alb_url)
-for i in $(seq 1 6); do curl -s "$ALB_URL"; echo; done   # különböző instance ID-k
-curl -s "$ALB_URL/health"                                # OK
+for i in $(seq 1 30); do curl -s "$ALB_URL"; done | sort | uniq -c
+curl -s "$ALB_URL/health"                 # OK
 ```
 
-### 6. Negatív tesztek
+**Várt eredmény:** mind a négy instance ID megjelenik, mindegyik mellett azzal, hány kérést kapott a 30-ból (nagyjából egyenletesen). Ha valamelyik hiányzik, az a gép `unhealthy` a target groupban. A teszt egyben a root összekötő szabályát is igazolja: enélkül az ALB nem érné el a gépeket.
 
-- **A bastionról nincs internet** (csak SSH a VPC-n belül): a bastionon a `curl -m 5 https://checkip.amazonaws.com` időtúllépéssel elhasal.
-- **A privát gépek kívülről nem érhetők el**, nincs publikus IP-jük; SSH csak a bastionon keresztül megy.
-- **A gépek HTTP-n közvetlenül nem érhetők el**, a 80-as port csak az ALB SG-ből nyitott.
+Ha a gépek `unhealthy`-k maradnak, két független dolgot érdemes ellenőrizni:
 
-### 7. Skálázhatóság
+|             | Target group regisztráció      | Összekötő SG szabály                                |
+| ----------- | ------------------------------ | --------------------------------------------------- |
+| Mit mond    | „ide küldd a forgalmat”        | „engedd be, ha az ALB küldi”                        |
+| Ha hiányzik | az ALB nem tudja, hova küldjön | az EC2 ajtaja nem engedi be, a health check elhasal |
 
-Módosítsd a `terraform.tfvars`-ban a `"private-a"` értékét 3-ra, és futtass `terraform plan`-t: csak egy új gép és egy új target group attachment jelenik meg, minden más változatlan. Utána állítsd vissza.
+### 6. Skálázhatóság (csak plan, a lebontás előtt)
+
+A `terraform.tfvars`-ban: `"private-a" = 3`, majd:
+
+```bash
+terraform plan
+```
+
+**Várt eredmény:** `Plan: 2 to add, 0 to change, 0 to destroy`:
+
+- `module.ec2.aws_instance.this["private-a-3"]`
+- `module.alb.aws_lb_target_group_attachment.this["private-a-3"]`
+
+Egyik meglévő erőforráshoz sem nyúl. Utána állítsd vissza 2-re, apply nélkül.
 
 ## Lebontás
 
@@ -282,6 +352,8 @@ A script:
 
 Ha a `destroy` hibával áll meg, a script is megáll (`set -euo pipefail`), és a state megmarad.
 
+Az AWS-ben lévő key pairt a `destroy` törli, mert a Terraform hozta létre és benne van a state-ben. A lokális kulcsokhoz (`~/.ssh/capstone-module-key` és `.pub`) a Terraform nem nyúl; ezek maradjanak meg, a következő apply ugyanabból a publikus kulcsból hozza létre újra az AWS key pairt.
+
 ## Költségek
 
 A NAT Gateway és az ALB óradíjas, és minden publikus IPv4 cím is (a bastionoké és a NAT Elastic IP-je is), akkor is, ha használatban van. A tesztek után érdemes azonnal lebontani a környezetet.
@@ -291,6 +363,6 @@ A NAT Gateway és az ALB óradíjas, és minden publikus IPv4 cím is (a bastion
 - **Bastion helyett SSM Session Manager vagy EC2 Instance Connect Endpoint:** publikus IP és nyitott 22-es port nélkül ad hozzáférést a privát gépekhez.
 - **HTTPS listener** ACM tanúsítvánnyal, a 80-as port átirányításával.
 - **NAT Gateway AZ-nként**, a single point of failure megszüntetésére.
-- **NACL-ok** a subnetek szintjén (a VPC modulba, a route táblák mellé).
+- **NACL-ok** a subnetek szintjén (a VPC modulba, a route táblák mellé, mert a subnethez kötődnek, nem a gépekhez).
 - **Az SSH összekötő szabály a rootba:** a bastion → EC2 szabály jelenleg az EC2 modulban van. Az ALB-hez hasonlóan a rootba téve az EC2 modulnak nem kellene tudnia a bastionról, és a két modul teljesen független lenne egymástól.
 - **Verziózott state bucket**, a state véletlen törlése vagy felülírása elleni védelemként (a teardownnak ekkor a régi verziókat is törölnie kell).
